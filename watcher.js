@@ -2,6 +2,7 @@
 // 整合 Claude 服務狀態（status.claude.com 公開 API）與本帳號用量（OAuth usage API），
 // 以 Discord Webhook 維護一則自動更新的儀表板訊息；事故新增/更新/解決與用量跨閾值時另發警報
 //（閾值 80% 起每 5% 一階，跨過各報一次）。
+// 另監控 NYCU 校園停電公告（十三舍相關；總務處＋住服組兩來源，預設每 30 分鐘），有新公告即發警報。
 // 無 npm 依賴（Node 18+ 全域 fetch）。用法：
 //   node watcher.js          常駐，每 pollMinutes 分鐘更新一次
 //   node watcher.js --once   跑一輪就結束（測試/排程用）
@@ -9,6 +10,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { execSync } = require('child_process');
 
 const DIR = __dirname;
 const CONFIG_PATH = path.join(DIR, 'config.json');
@@ -20,6 +22,23 @@ const STATUS_INCIDENTS_URL = 'https://status.claude.com/api/v2/incidents.json';
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 const AVATAR_URL =
   'https://dka575ofm4ao0.cloudfront.net/pages-email_logos/original/362807/NEW_claude_status_email.png-d88779a1-c7b3-456d-b84e-1d0cdd4614e9.png';
+
+// 停電公告監控來源（十三舍＝光復校區；兩頁皆為 server-rendered HTML，2026-08-26 實測可直接 fetch）
+// 十三舍停電多為總務處營繕二組自辦工程，不會出現在台電對外停電資料，故只爬校內公告
+const OUTAGE_SOURCES = [
+  {
+    key: 'ga',
+    name: '總務處 停水電空調',
+    base: 'https://ga.nycu.edu.tw',
+    url: 'https://ga.nycu.edu.tw/ga/ch/app/news/list?module=headnews&id=5303&dataClass=53d910fb-d1e6-4fe4-9cd4-f738d70c5c63',
+  },
+  {
+    key: 'osa',
+    name: '住服組 交大校區宿舍',
+    base: 'https://www.nycu.edu.tw',
+    url: 'https://www.nycu.edu.tw/osa/ch/app/data/list?module=nycu0084&id=3465',
+  },
+];
 
 const args = process.argv.slice(2);
 const ONCE = args.includes('--once') || args.includes('--dry');
@@ -63,6 +82,21 @@ function colorBar(pct) {
 
 function stripHtml(t) {
   return String(t || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+}
+
+function decodeEntities(s) {
+  return String(s || '')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+}
+
+// 民國日期（115-07-14）→ Date；解析失敗回 null
+function rocDate(s) {
+  const m = /(\d{2,3})-(\d{1,2})-(\d{1,2})/.exec(s || '');
+  return m ? new Date(Date.UTC(+m[1] + 1911, +m[2] - 1, +m[3])) : null;
 }
 
 // ===== 資料抓取 =====
@@ -139,12 +173,17 @@ function buildDashboard(status, usage) {
 
   const hhmm = (iso) =>
     new Date(iso).toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei', hour: '2-digit', minute: '2-digit', hour12: false });
-  const scoped = (usage.limits || []).filter((l) => l.kind === 'weekly_scoped' && l.scope && l.scope.model);
+  // usage 為 null＝該輪 usage API 失敗（如 429 限流），儀表板降級顯示、其餘照常
+  const scoped = usage ? (usage.limits || []).filter((l) => l.kind === 'weekly_scoped' && l.scope && l.scope.model) : [];
 
   const lines = [
-    `${colorBar(usage.five_hour.utilization)} 5h **${usage.five_hour.utilization}%**（${hhmm(usage.five_hour.resets_at)} 重置）`,
-    `${colorBar(usage.seven_day.utilization)} 週 **${usage.seven_day.utilization}%**`,
-    ...scoped.map((l) => `${colorBar(l.percent)} ${l.scope.model.display_name} **${l.percent}%**`),
+    ...(usage
+      ? [
+          `${colorBar(usage.five_hour.utilization)} 5h **${usage.five_hour.utilization}%**（${hhmm(usage.five_hour.resets_at)} 重置）`,
+          `${colorBar(usage.seven_day.utilization)} 週 **${usage.seven_day.utilization}%**`,
+          ...scoped.map((l) => `${colorBar(l.percent)} ${l.scope.model.display_name} **${l.percent}%**`),
+        ]
+      : ['⚠️ 用量資料暫時無法取得（API 限流或逾時），恢復後自動補上']),
     ...active.slice(0, 3).map((i) => `${IMPACT_EMOJI[i.impact] || '🚨'} ${i.name}（${i.status}）`),
   ];
   if (active.length > 3) lines.push(`…另有 ${active.length - 3} 件進行中`);
@@ -200,10 +239,10 @@ function collectAlerts(status, usage, state, config) {
   }
   state.incidents = nowTracked;
 
-  // 用量閾值（跨過才報一次；視窗重置後歸零）
+  // 用量閾值（跨過才報一次；視窗重置後歸零）；usage 失敗的輪次跳過，水位不動
   const thresholds = config.usageThresholds || [80, 85, 90, 95, 100];
   state.usage = state.usage || {};
-  const metrics = [
+  const metrics = !usage ? [] : [
     ['5 小時限制', 'five_hour', usage.five_hour.utilization, usage.five_hour.resets_at],
     ['一週限制', 'seven_day', usage.seven_day.utilization, usage.seven_day.resets_at],
     ...(usage.limits || [])
@@ -227,10 +266,204 @@ function collectAlerts(status, usage, state, config) {
   return { alerts, toDelete };
 }
 
+// ===== 停電公告監控 =====
+// 列表項格式（兩來源同構）：<a id="listImageNumN" href="..." title="...">…發布/更新日期：115-07-14
+function parseAnnouncements(html, source) {
+  const items = [];
+  const re = /<a\s+id="listImageNum\d+"\s+href="([^"]+)"\s+title="([^"]+)"/g;
+  let m;
+  while ((m = re.exec(html))) {
+    const href = decodeEntities(m[1]);
+    const title = decodeEntities(m[2])
+      .replace(/\(開啟新視窗\)/g, '')
+      .replace(/\((?:doc|docx|pdf|odt)\)/gi, '')
+      .trim();
+    const tail = html.slice(re.lastIndex, re.lastIndex + 600);
+    const dm = /(?:發布|更新)日期：\s*([\d-]+)/.exec(tail);
+    items.push({
+      id: source.key + ':' + href,
+      url: href.startsWith('http') ? href : source.base + href,
+      title,
+      dateText: dm ? dm[1] : '',
+      date: dm ? rocDate(dm[1]) : null,
+      source,
+    });
+  }
+  return items;
+}
+
+// 十三舍相關性判斷（只能看標題：doc 型公告是純附件、無內文頁）。
+// 原則：寧可多報不可漏報——只有「明確點名其他地點且未含十三舍」才略過。
+// 回傳 'direct'（點名十三舍）｜'broad'（全校/光復/宿舍區級）｜'unknown'（標題沒講範圍）｜null（不相關）
+function outageRelevance(title) {
+  if (!/停電|電力/.test(title)) return null;
+  if (/十三舍|13舍/.test(title)) return 'direct';
+  if (/全校|全區|光復|交大校區|各宿舍|宿舍區/.test(title)) return 'broad';
+  if (/舍|館|大樓|校區|齋|中心|棟/.test(title)) return null;
+  return 'unknown';
+}
+
+// 本機常駐服務的排程任務對應表（新 bot 上排程後在這裡補一行，未列的 Running 任務仍會以原名列出）
+const KNOWN_TASKS = {
+  ClaudeStatusWatcher: { label: 'Claude Status watcher（本儀表板）', kind: 'resident' },
+  PlaneDiscordBot: { label: 'Plane Discord bot', kind: 'resident' },
+  ClaudeLearningBot: { label: 'Claude 學習 bot', kind: 'resident' },
+  LofiShortsDaily: { label: 'Lofi Shorts 每日產製', kind: 'daily' },
+};
+const VENDOR_TASK_RE = /AMD|MicrosoftEdge|NVIDIA|OneDrive|Overwolf|ModifyLinkUpdate|Adobe|Google|Intel|Realtek/i;
+
+// 掃描根路徑排程任務，組出「停電時本機會停擺什麼」的一行描述；失敗回 null（警報照發）
+function listLocalServices() {
+  try {
+    const ps = `Get-ScheduledTask | Where-Object { $_.TaskPath -eq '\\' } | Select-Object TaskName,State | ConvertTo-Json -Compress`;
+    const out = execSync(
+      'powershell.exe -NoProfile -NonInteractive -EncodedCommand ' +
+        Buffer.from(ps, 'utf16le').toString('base64'),
+      { encoding: 'utf8', timeout: 20000, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] }
+    );
+    const STATE = { 0: 'Unknown', 1: 'Disabled', 2: 'Queued', 3: 'Ready', 4: 'Running' };
+    let tasks = JSON.parse(out.trim());
+    if (!Array.isArray(tasks)) tasks = [tasks];
+    const resident = [];
+    const daily = [];
+    for (const t of tasks) {
+      const st = typeof t.State === 'number' ? STATE[t.State] : String(t.State);
+      const known = KNOWN_TASKS[t.TaskName];
+      if (known) {
+        if (known.kind === 'daily') {
+          if (st !== 'Disabled') daily.push(known.label);
+        } else if (st === 'Running') resident.push(known.label);
+      } else if (st === 'Running' && !VENDOR_TASK_RE.test(t.TaskName)) {
+        resident.push(t.TaskName); // 未登錄的自訂常駐任務，以原名列出
+      }
+    }
+    const parts = [];
+    if (resident.length) parts.push(`${resident.join('、')}（常駐中，斷電即停擺）`);
+    if (daily.length) parts.push(`${daily.join('、')}（停電時段排程將缺產）`);
+    return parts.length ? parts.join('；') : '無常駐服務在跑';
+  } catch (e) {
+    log('listLocalServices failed: ' + e.message);
+    return null;
+  }
+}
+
+// 從公告文字抽「停電時間」與「停電區域」；抽不到的欄位回 null
+function extractOutageInfo(text, title) {
+  const t = String(text || '').replace(/\s+/g, ' ');
+  let time = null;
+  let area = null;
+  let m = /停電(?:日期及)?時間[：: ]\s*([^。；;]{4,80})/.exec(t);
+  if (!m) m = /((?:\d{2,3}年\s?)?\d{1,2}\/\d{1,2}[^，。；;]{0,40}?(?:起?至|[-~～][^，。；;]{0,20})[^，。；;]{0,40}?(?:止|\d{1,2}[:：]\d{2}))/.exec(t);
+  if (m) time = m[1].trim();
+  m = /停電(?:區域|範圍)[：: ]\s*([^。；;]{2,80})/.exec(t);
+  if (m) area = m[1].trim();
+  if (!area) {
+    // 退而求其次：標題括號內通常就是棟舍清單，例：停電公告（研二，研三，十二舍，十三舍）
+    m = /[（(]([^）)]{2,60})[）)]/.exec(String(title || ''));
+    if (m && /舍|校區|館|大樓|全/.test(m[1])) area = m[1].trim();
+  }
+  if (!time) {
+    m = /[（(]([^）)]*\d{1,2}\/\d{1,2}[^）)]*)[）)]/.exec(String(title || ''));
+    if (m) time = m[1].trim();
+  }
+  return { time, area };
+}
+
+// view 型公告抓詳情頁內文（<div class="ed_txt">）；doc 型（純附件）回 null
+async function fetchOutageDetail(item) {
+  if (!/\/news\/view\?|\/data\/view\?/.test(item.url)) return null;
+  try {
+    const res = await fetch(item.url, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const html = await res.text();
+    const m = /<div class="ed_txt">([\s\S]*?)<\/div>/.exec(html);
+    return m ? stripHtml(m[1]).slice(0, 3000) : null;
+  } catch (e) {
+    log(`outage detail fetch failed（${item.url}）: ${e.message}`);
+    return null;
+  }
+}
+
+// 回傳 true＝本輪有執行（state 需存檔）；false＝未到輪詢間隔
+async function checkOutages(config, state) {
+  const pollMs = (config.outagePollMinutes || 30) * 60 * 1000;
+  const o = (state.outage = state.outage || { seen: {}, lastCheckedAt: 0 });
+  if (!ONCE && Date.now() - o.lastCheckedAt < pollMs) return false;
+  o.lastCheckedAt = Date.now();
+
+  const firstRun = Object.keys(o.seen).length === 0;
+  for (const source of OUTAGE_SOURCES) {
+    let html;
+    try {
+      const res = await fetch(source.url, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: AbortSignal.timeout(30000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      html = await res.text();
+    } catch (e) {
+      log(`outage source ${source.key} fetch failed: ${e.message}`);
+      continue;
+    }
+    const items = parseAnnouncements(html, source);
+    if (!items.length) {
+      log(`outage source ${source.key}: 0 筆（頁面可能改版，需人工檢查解析規則）`);
+      continue;
+    }
+    log(`outage source ${source.key}: ${items.length} 筆（最新：${items[0].title}｜${items[0].dateText}）`);
+    for (const it of items) {
+      if (o.seen[it.id]) continue;
+      o.seen[it.id] = Date.now();
+      const rel = outageRelevance(it.title);
+      if (!rel) continue;
+      // 首輪只補報 14 天內的公告，避免灌歷史訊息
+      if (firstRun && (!it.date || Date.now() - it.date.getTime() > 14 * 86400000)) continue;
+      const tag =
+        rel === 'direct' ? '🚨 **十三舍停電公告**' : '🔌 **停電公告（可能涵蓋十三舍）**';
+      const detail = await fetchOutageDetail(it); // doc 型附件無內文頁，回 null
+      const info = extractOutageInfo(detail, it.title);
+      const services = listLocalServices();
+      const lines = [
+        `${tag}：${it.title}`,
+        `⏰ 停電時間：${info.time || (detail ? '未能自動擷取，見公告原文' : '見公告附件')}`,
+        `📍 停電區域：${info.area || '未能自動擷取，見公告原文'}`,
+      ];
+      if (services) lines.push(`🤖 屆時本機停擺：${services}`);
+      lines.push(`-# ${it.source.name}｜發布 ${it.dateText || '?'}｜[公告原文](<${it.url}>)`);
+      await webhookPost(config, { content: lines.join('\n') });
+      log('outage alert sent: ' + it.title);
+    }
+  }
+
+  // seen 上限 300 筆，砍最舊的（value＝首見時間戳）
+  const keys = Object.keys(o.seen);
+  if (keys.length > 300) {
+    keys.sort((a, b) => o.seen[a] - o.seen[b]);
+    for (const k of keys.slice(0, keys.length - 300)) delete o.seen[k];
+  }
+  return true;
+}
+
 // ===== 主流程 =====
 async function tick(config) {
   const state = loadJson(STATE_PATH, {});
-  const [status, usage] = await Promise.all([fetchStatus(), fetchUsage()]);
+
+  // 停電線獨立 try/catch＋提前存檔：Claude API 掛掉不影響停電監控，反之亦然
+  try {
+    if ((await checkOutages(config, state)) && !DRY) saveState(state);
+  } catch (e) {
+    log('outage check error: ' + e.message);
+  }
+  const [status, usage] = await Promise.all([
+    fetchStatus(),
+    fetchUsage().catch((e) => {
+      log('usage fetch failed（本輪儀表板降級顯示，警報水位不動）: ' + e.message);
+      return null;
+    }),
+  ]);
 
   // 儀表板：編輯既有訊息，不存在就重發
   const dashboard = buildDashboard(status, usage);
@@ -270,7 +503,11 @@ async function tick(config) {
   for (const id of toDelete) await tryDelete(id);
 
   if (!DRY) saveState(state); // dry-run 不得留下副作用（否則會吃掉真警報的水位）
-  log(`tick ok（5h ${usage.five_hour.utilization}% / 週 ${usage.seven_day.utilization}%，警報 ${alerts.length} 則）`);
+  log(
+    usage
+      ? `tick ok（5h ${usage.five_hour.utilization}% / 週 ${usage.seven_day.utilization}%，警報 ${alerts.length} 則）`
+      : `tick ok（用量降級中，警報 ${alerts.length} 則）`
+  );
 }
 
 async function main() {
@@ -297,4 +534,15 @@ async function main() {
   if (!ONCE) setInterval(run, pollMs);
 }
 
-main();
+if (!process.env.WATCHER_NO_MAIN) main();
+
+// 測試用出口（WATCHER_NO_MAIN=1 時可 require 本檔而不啟動輪詢）
+module.exports = {
+  parseAnnouncements,
+  outageRelevance,
+  extractOutageInfo,
+  fetchOutageDetail,
+  listLocalServices,
+  buildDashboard,
+  collectAlerts,
+};
