@@ -6,6 +6,8 @@
 
 - 服務狀態：`status.claude.com/api/v2/summary.json` ＋ `incidents.json`（公開 API）
 - 用量：`api.anthropic.com/api/oauth/usage`（token 每次從 `~/.claude/.credentials.json` 重讀，Claude Code 會自動輪替 token）
+  - **與 statusline 共用快取 `~/.claude/sl-usage-cache.json`**（2026-09-07 起）：這支 API 有帳號級限流且無公開文件，watcher 與每個 Claude Code session 的 statusline 都打它，實測 3 個 session 開著時 watcher 幾乎每輪 429、一鎖整小時。現在 watcher 先讀快取，5 分鐘內的直接用；過期才自己打，打成功也寫回同一份，兩邊合計只打一份的量
+  - 已知狀況不算錯誤、儀表板沿用上一次成功值並標資料時間：429（之後退避 10 分鐘）、token 過期（credentials 的 `expiresAt` 已過＝Claude Code 尚未 refresh，watcher 不會自己 refresh，跳過不打）、401
 - 僅支援目前登入的帳號（credentials 檔為單帳號結構，多帳號經評估不可行）
 - 停電公告（2026-08-26 加入，來源實測見下）：
   - 總務處「停水電空調」分類（營繕二組，十三舍停電的權威來源）：`ga.nycu.edu.tw/ga/ch/app/news/list?module=headnews&id=5303&dataClass=53d910fb-...`
@@ -27,7 +29,7 @@
 
 1. Discord 建一個文字頻道（例：`#claude-status`）→ 頻道設定 → 整合 → Webhook → 新增 Webhook → 複製 URL。
 2. 把 URL 貼進 `config.json` 的 `webhookUrl`。
-3. 測試一輪：`node watcher.js --once`——頻道應出現儀表板訊息（建議釘選）。
+3. 測試一輪：`node watcher.js --once`——頻道應出現儀表板訊息。**不要釘選**：儀表板會在每次發通報後刪掉重發到頻道最底，訊息 id 會變。
 4. 註冊開機常駐（PowerShell，系統管理員不需要）：
    ```powershell
    Register-ScheduledTask -TaskName "ClaudeStatusWatcher" `
@@ -45,7 +47,9 @@
 | `outagePollMinutes` | 30 | 停電公告輪詢頻率（`--once`/`--dry` 時無視間隔強制檢查） |
 | `usageThresholds` | [80, 85, 90, 95, 100] | 用量警報閾值（%），跨過各報一次，視窗重置後歸零；80% 起每 5% 一階 |
 
-警報管理規則（寫死在 watcher.js）：用量警報只留最新一則；新事故通知保留；每件事故的更新警報只留最新一則；事故解決＝自動撤下該事故的更新警報、不另發解決訊息。
+警報管理規則（寫死在 watcher.js）：用量警報只留最新一則；每件事故的新事故通知與更新警報各留一則（更新只留最新）；事故解決＝自動撤下該事故的新事故通知與更新警報、不另發解決訊息（2026-09-08 起，先前只撤更新警報）。追蹤中的事故若從官方清單消失（掉出前 30 筆）也視同解決一併撤下。頻道因此只剩進行中的事故＋儀表板。
+
+**儀表板永遠在頻道最底**（2026-09-07 起）：某一輪若發出任何通報（停電／事故／用量），儀表板會被擠上去，該輪末尾就把舊儀表板刪掉、重發一則到最下方；沒發通報的輪次則原地編輯。所以用量隨時看得到，不用往上捲。
 
 ## 檔案
 
@@ -53,6 +57,7 @@
 - `gmail-outage-notifier.gs` — 學校信箱停電信監控（貼進該帳號的 script.google.com，與本機無關；貼上前把 `WEBHOOK_URL` 佔位符換成 config.json 的 `webhookUrl`）
 - `start-watcher.cmd` ＋ `start-watcher-hidden.vbs` — 隱藏視窗常駐＋崩潰自動重啟（沿用 plane bot 驗證過的模式；.cmd 純 ASCII）
 - `state.json` — 執行期狀態（儀表板訊息 id、已通報事故、用量警報水位），刪掉會重發儀表板
+- `~/.claude/sl-usage-cache.json`（專案外）— 與 statusline 共用的用量快取，watcher 讀也寫；刪掉無害，下一輪重抓
 - `watcher.log` — 執行紀錄
 - `usage-api-sample.json` — 用量 API 回應樣本（欄位參考）
 

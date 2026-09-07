@@ -20,6 +20,13 @@ const CREDENTIALS_PATH = 'C:/Users/user/.claude/.credentials.json';
 const STATUS_SUMMARY_URL = 'https://status.claude.com/api/v2/summary.json';
 const STATUS_INCIDENTS_URL = 'https://status.claude.com/api/v2/incidents.json';
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+// statusline（~/.claude/statusline-command.sh）也打同一支 usage API，並以 90 秒檔案快取落在這裡。
+// 該 API 有帳號級限流且無公開文件（2026-09-07 實測：3 個 Claude Code session 開著時 watcher 幾乎每輪 429，
+// retry-after 0，一次被鎖常達整小時），故 watcher 改為與 statusline 共用這份快取：
+// 快取夠新就直接用、自己打成功也寫回，兩個消費者合計只打一份的量。
+const USAGE_CACHE_PATH = 'C:/Users/user/.claude/sl-usage-cache.json';
+const USAGE_CACHE_MAX_AGE_MS = 5 * 60 * 1000; // 快取在這個時間內視為最新，不打 API
+const USAGE_BACKOFF_MS = 10 * 60 * 1000; // 被 429 之後暫停打 API 的時間（期間沿用舊值顯示）
 const AVATAR_URL =
   'https://dka575ofm4ao0.cloudfront.net/pages-email_logos/original/362807/NEW_claude_status_email.png-d88779a1-c7b3-456d-b84e-1d0cdd4614e9.png';
 
@@ -108,20 +115,71 @@ async function fetchStatus() {
   return { summary, incidents: incidents.incidents || [] };
 }
 
+// 讀 statusline 共用快取；回 { data, at }（at＝檔案 mtime，ms），檔案不存在／半截／非用量回應體時回 null
+function readUsageCache() {
+  try {
+    const st = fs.statSync(USAGE_CACHE_PATH);
+    const data = JSON.parse(fs.readFileSync(USAGE_CACHE_PATH, 'utf8'));
+    if (!data || !data.five_hour || !data.seven_day) return null;
+    return { data, at: st.mtimeMs };
+  } catch (_) {
+    return null;
+  }
+}
+
+// 與 statusline 同格式（API 原始 JSON）、tmp＋rename 原子替換；tmp 名稱與 statusline 的 .tmp 錯開
+function writeUsageCache(data) {
+  const tmp = USAGE_CACHE_PATH + '.watcher.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(data));
+  fs.renameSync(tmp, USAGE_CACHE_PATH);
+}
+
+let usageBackoffUntil = 0;
+
+// 回傳 { data, at, source, note, stale }：
+//   data  ＝本輪可用的用量（快取或 API），null＝本輪拿不到新資料（警報水位不動）
+//   at    ＝data 的資料時間（ms）；source＝'cache'|'api'
+//   note  ＝拿不到的原因（顯示在儀表板與 log）；stale＝過期的快取（有就拿來顯示上一次成功值）
+// 401／429／token 過期都是已知狀況，走 note 不 throw；只有非預期錯誤才 throw
 async function fetchUsage() {
-  // token 由 Claude Code 自動輪替，每次都重讀檔案
-  const cred = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
-  const token = cred.claudeAiOauth && cred.claudeAiOauth.accessToken;
-  if (!token) throw new Error('credentials 檔內找不到 claudeAiOauth.accessToken');
+  const cached = readUsageCache();
+  const degraded = (note) => ({ data: null, note, stale: cached });
+
+  // 1. statusline 剛抓過的就直接用，不再打 API
+  if (cached && Date.now() - cached.at < USAGE_CACHE_MAX_AGE_MS) return { ...cached, source: 'cache' };
+
+  // 2. token 已過期＝Claude Code 尚未 refresh（watcher 只讀檔、不自己 refresh），打了必 401，跳過等下一輪
+  const cred = loadJson(CREDENTIALS_PATH, {});
+  const oauth = cred.claudeAiOauth || {};
+  if (!oauth.accessToken) throw new Error('credentials 檔內找不到 claudeAiOauth.accessToken');
+  if (oauth.expiresAt && Date.now() > oauth.expiresAt) return degraded('token 已過期，等待 Claude Code 更新');
+  if (Date.now() < usageBackoffUntil) return degraded('API 限流退避中');
+
   const res = await fetch(USAGE_URL, {
-    headers: { Authorization: `Bearer ${token}`, 'anthropic-beta': 'oauth-2025-04-20' },
+    headers: { Authorization: `Bearer ${oauth.accessToken}`, 'anthropic-beta': 'oauth-2025-04-20' },
   });
+  if (res.status === 429) {
+    usageBackoffUntil = Date.now() + USAGE_BACKOFF_MS;
+    return degraded('API 限流（HTTP 429）');
+  }
+  if (res.status === 401) return degraded('token 失效（HTTP 401）');
   if (!res.ok) throw new Error(`usage API HTTP ${res.status}`);
-  return res.json();
+  const data = await res.json();
+  if (!DRY) {
+    try {
+      writeUsageCache(data); // 讓 statusline 也吃到這份，省下它的下一次呼叫
+    } catch (e) {
+      log('usage cache write failed: ' + e.message);
+    }
+  }
+  return { data, at: Date.now(), source: 'api' };
 }
 
 // ===== Discord webhook =====
+let postsThisTick = 0; // 本輪發出的訊息數（停電／事故／用量通報）；>0 表示儀表板被擠上去了，輪末重發到最底
+
 async function webhookPost(config, payload) {
+  postsThisTick++;
   if (DRY) {
     log('DRY post: ' + JSON.stringify(payload).slice(0, 800));
     return { id: 'dry-run' };
@@ -165,25 +223,28 @@ const IMPACT_EMOJI = { none: '🟢', minor: '🟡', major: '🟠', critical: '�
 const STATUS_TEXT = { none: '正常運作', minor: '輕微異常', major: '部分服務異常', critical: '重大故障' };
 
 // 極簡版：標題一句話狀態；內文一行用量＋進行中事故只列名稱（細節點標題連結看官網）
-function buildDashboard(status, usage) {
+// usage 為 null＝本輪拿不到新資料：meta.stale 有值就顯示上一次成功的數值＋資料時間（meta.note 說明原因），
+// 連舊值都沒有才顯示「無法取得」
+function buildDashboard(status, usage, meta = {}) {
   const ind = (status.summary.status && status.summary.status.indicator) || 'none';
   const active = status.incidents.filter((i) => i.status !== 'resolved' && i.status !== 'postmortem');
 
   const color = ind === 'critical' || ind === 'major' ? 0xed4245 : ind === 'minor' ? 0xfee75c : 0x57f287;
 
-  const hhmm = (iso) =>
-    new Date(iso).toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei', hour: '2-digit', minute: '2-digit', hour12: false });
-  // usage 為 null＝該輪 usage API 失敗（如 429 限流），儀表板降級顯示、其餘照常
-  const scoped = usage ? (usage.limits || []).filter((l) => l.kind === 'weekly_scoped' && l.scope && l.scope.model) : [];
+  const hhmm = (t) =>
+    new Date(t).toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei', hour: '2-digit', minute: '2-digit', hour12: false });
+  const shown = usage || (meta.stale && meta.stale.data) || null;
+  const scoped = shown ? (shown.limits || []).filter((l) => l.kind === 'weekly_scoped' && l.scope && l.scope.model) : [];
 
   const lines = [
-    ...(usage
+    ...(shown
       ? [
-          `${colorBar(usage.five_hour.utilization)} 5h **${usage.five_hour.utilization}%**（${hhmm(usage.five_hour.resets_at)} 重置）`,
-          `${colorBar(usage.seven_day.utilization)} 週 **${usage.seven_day.utilization}%**`,
+          `${colorBar(shown.five_hour.utilization)} 5h **${shown.five_hour.utilization}%**（${hhmm(shown.five_hour.resets_at)} 重置）`,
+          `${colorBar(shown.seven_day.utilization)} 週 **${shown.seven_day.utilization}%**`,
           ...scoped.map((l) => `${colorBar(l.percent)} ${l.scope.model.display_name} **${l.percent}%**`),
+          ...(usage ? [] : [`⚠️ ${meta.note || '暫時無法更新'}，以上為 ${hhmm(meta.stale.at)} 的資料`]),
         ]
-      : ['⚠️ 用量資料暫時無法取得（API 限流或逾時），恢復後自動補上']),
+      : [`⚠️ 用量資料暫時無法取得（${meta.note || 'API 限流或逾時'}），恢復後自動補上`]),
     ...active.slice(0, 3).map((i) => `${IMPACT_EMOJI[i.impact] || '🚨'} ${i.name}（${i.status}）`),
   ];
   if (active.length > 3) lines.push(`…另有 ${active.length - 3} 件進行中`);
@@ -204,7 +265,8 @@ function buildDashboard(status, usage) {
 
 // ===== 警報判斷 =====
 // 回傳 { alerts: [{type:'new'|'update'|'usage', text, incidentId?}], toDelete: [messageId] }
-// 規則：新事故通知保留；每件事故的更新警報只留最新一則；事故解決＝撤下其更新警報、不另發訊息。
+// 規則：每件事故的新事故通知與更新警報各留一則（更新只留最新）；事故解決＝兩則一起撤下、不另發訊息。
+// 頻道因此只剩「進行中的事故」＋儀表板，解決的事故不留痕（細節看官網）。
 const LINK_FOOTER = '\n-# [status.claude.com](<https://status.claude.com>)';
 
 function collectAlerts(status, usage, state, config) {
@@ -212,18 +274,31 @@ function collectAlerts(status, usage, state, config) {
   const toDelete = [];
   const tracked = state.incidents || {};
   const nowTracked = {};
+  const seen = new Set();
+  const retire = (prev) => {
+    // 事故解決（或從官方清單消失）：撤下該事故的新事故通知與更新警報，不發解決訊息
+    if (prev.newAlertId) toDelete.push(prev.newAlertId);
+    if (prev.updateAlertId) toDelete.push(prev.updateAlertId);
+  };
 
   for (const i of status.incidents.slice(0, 30)) {
+    seen.add(i.id);
     const latest = (i.incident_updates || [])[0];
     const latestAt = latest ? latest.created_at : i.created_at;
     const prev = tracked[i.id];
     const isActive = i.status !== 'resolved' && i.status !== 'postmortem';
 
     if (isActive) {
-      nowTracked[i.id] = { latestAt, status: i.status, updateAlertId: prev && prev.updateAlertId };
+      nowTracked[i.id] = {
+        latestAt,
+        status: i.status,
+        newAlertId: prev && prev.newAlertId,
+        updateAlertId: prev && prev.updateAlertId,
+      };
       if (!prev) {
         alerts.push({
           type: 'new',
+          incidentId: i.id,
           text: `🚨 **新事故**：${i.name}（impact: ${i.impact}）\n> ${latest ? stripHtml(latest.body).slice(0, 200) : ''}${LINK_FOOTER}`,
         });
       } else if (prev.latestAt !== latestAt) {
@@ -234,9 +309,11 @@ function collectAlerts(status, usage, state, config) {
         });
       }
     } else if (prev) {
-      if (prev.updateAlertId) toDelete.push(prev.updateAlertId); // 解決：撤下更新警報，不發解決訊息
+      retire(prev);
     }
   }
+  // 追蹤中但這次官方清單裡沒有的（掉出前 30 筆）：視同已解決，一併撤下，否則通知會永遠留在頻道
+  for (const id of Object.keys(tracked)) if (!seen.has(id)) retire(tracked[id]);
   state.incidents = nowTracked;
 
   // 用量閾值（跨過才報一次；視窗重置後歸零）；usage 失敗的輪次跳過，水位不動
@@ -450,6 +527,7 @@ async function checkOutages(config, state) {
 // ===== 主流程 =====
 async function tick(config) {
   const state = loadJson(STATE_PATH, {});
+  postsThisTick = 0;
 
   // 停電線獨立 try/catch＋提前存檔：Claude API 掛掉不影響停電監控，反之亦然
   try {
@@ -457,34 +535,24 @@ async function tick(config) {
   } catch (e) {
     log('outage check error: ' + e.message);
   }
-  const [status, usage] = await Promise.all([
+  const [status, u] = await Promise.all([
     fetchStatus(),
-    fetchUsage().catch((e) => {
-      log('usage fetch failed（本輪儀表板降級顯示，警報水位不動）: ' + e.message);
-      return null;
-    }),
+    fetchUsage().catch((e) => ({ data: null, note: e.message, stale: readUsageCache() })),
   ]);
-
-  // 儀表板：編輯既有訊息，不存在就重發
-  const dashboard = buildDashboard(status, usage);
-  let edited = false;
-  if (state.dashboardMessageId) {
-    edited = await webhookEdit(config, state.dashboardMessageId, dashboard);
-  }
-  if (!edited) {
-    const msg = await webhookPost(config, dashboard);
-    state.dashboardMessageId = msg.id;
-    log(`dashboard message created: ${msg.id}（建議在 Discord 把這則訊息釘選）`);
+  const usage = u.data; // null＝本輪無新資料：警報水位不動、儀表板沿用舊值顯示
+  if (!usage) {
+    const staleAt = u.stale ? new Date(u.stale.at).toISOString().slice(11, 16) + 'Z' : null;
+    log(`usage 降級：${u.note}${staleAt ? `（儀表板沿用 ${staleAt} 的資料）` : '（無舊值可用）'}`);
   }
 
   // 警報管理：用量警報只留最新一則；新事故保留；事故更新每件只留最新一則；解決＝撤下更新警報
   const { alerts, toDelete } = collectAlerts(status, usage, state, config);
-  const tryDelete = async (id) => {
+  const tryDelete = async (id, what = 'old alert') => {
     try {
       await webhookDelete(config, id);
-      log('old alert deleted: ' + id);
+      log(`${what} deleted: ${id}`);
     } catch (e) {
-      log('alert cleanup failed: ' + e.message);
+      log(`${what} cleanup failed: ${e.message}`);
     }
   };
   for (const a of alerts) {
@@ -493,6 +561,9 @@ async function tick(config) {
     if (a.type === 'usage') {
       if (state.usageAlertId) await tryDelete(state.usageAlertId);
       state.usageAlertId = id || state.usageAlertId;
+    } else if (a.type === 'new') {
+      const inc = state.incidents[a.incidentId];
+      if (inc && id) inc.newAlertId = id; // 記住訊息 id，事故解決時撤下
     } else if (a.type === 'update') {
       const inc = state.incidents[a.incidentId];
       if (inc && inc.updateAlertId) await tryDelete(inc.updateAlertId);
@@ -502,10 +573,25 @@ async function tick(config) {
   }
   for (const id of toDelete) await tryDelete(id);
 
+  // 儀表板：本輪沒發任何通報就原地編輯；有發通報（儀表板被擠上去了）就刪掉舊的、重發一則到頻道最底，
+  // 讓用量永遠停在畫面最下方（因此儀表板訊息 id 會變，不要釘選）
+  const dashboard = buildDashboard(status, usage, u);
+  const bumped = postsThisTick > 0;
+  let edited = false;
+  if (state.dashboardMessageId && !bumped) {
+    edited = await webhookEdit(config, state.dashboardMessageId, dashboard);
+  }
+  if (!edited) {
+    if (state.dashboardMessageId && bumped) await tryDelete(state.dashboardMessageId, 'dashboard');
+    const msg = await webhookPost(config, dashboard);
+    if (msg && msg.id && msg.id !== 'dry-run') state.dashboardMessageId = msg.id;
+    log(`dashboard message ${bumped ? 're-posted to bottom' : 'created'}: ${msg.id}`);
+  }
+
   if (!DRY) saveState(state); // dry-run 不得留下副作用（否則會吃掉真警報的水位）
   log(
     usage
-      ? `tick ok（5h ${usage.five_hour.utilization}% / 週 ${usage.seven_day.utilization}%，警報 ${alerts.length} 則）`
+      ? `tick ok（5h ${usage.five_hour.utilization}% / 週 ${usage.seven_day.utilization}%，來源 ${u.source}，警報 ${alerts.length} 則）`
       : `tick ok（用量降級中，警報 ${alerts.length} 則）`
   );
 }
@@ -515,11 +601,11 @@ async function main() {
   if (!config || !config.webhookUrl || config.webhookUrl.includes('PENDING')) {
     if (DRY) {
       log('dry-run：webhook 未設定，僅測試資料抓取與組裝');
-      const [status, usage] = await Promise.all([fetchStatus(), fetchUsage()]);
-      const dashboard = buildDashboard(status, usage);
+      const [status, u] = await Promise.all([fetchStatus(), fetchUsage()]);
+      const dashboard = buildDashboard(status, u.data, u);
       console.log(JSON.stringify(dashboard, null, 1));
       const state = loadJson(STATE_PATH, {});
-      const alerts = collectAlerts(status, usage, state, config || {});
+      const alerts = collectAlerts(status, u.data, state, config || {});
       console.log('alerts:', JSON.stringify(alerts, null, 1));
       return;
     }
@@ -545,4 +631,7 @@ module.exports = {
   listLocalServices,
   buildDashboard,
   collectAlerts,
+  fetchUsage,
+  readUsageCache,
+  tick,
 };
