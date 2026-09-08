@@ -5,6 +5,8 @@
 
 // 貼進 Apps Script 前，把下行換成 config.json 的 webhookUrl（真實 URL 不入 git，比照 config.json）
 var WEBHOOK_URL = 'PASTE_WEBHOOK_URL_HERE';
+// 收信的 Google 帳號：讓通知裡的「開啟信件」直接開對帳號（瀏覽器登入多個帳號時 /u/0/ 會開到第一個）；留空則退回 /u/0/
+var MAIL_ACCOUNT = 'aeri.la13@nycu.edu.tw';
 
 // 第一層：信件必須含停電/電力字眼（主旨或內文）
 var TOPIC_RE = /停電|電力檢修|電力維修|電力保養|高壓設備|停水停電/;
@@ -45,7 +47,7 @@ function checkOutageMail() {
       lines.push('📍 停電區域：' + (am ? am[1].trim() : '未能自動擷取，見信件'));
       if (!tm || !am) lines.push('> ' + flat.slice(0, 250));
       lines.push(
-        '-# ' + msg.getFrom() + '（' + Utilities.formatDate(msg.getDate(), 'Asia/Taipei', 'MM/dd HH:mm') + '）｜[開啟信件](<https://mail.google.com/mail/u/0/#search/rfc822msgid:' + encodeURIComponent(msg.getHeader('Message-ID').replace(/[<>]/g, '')) + '>)'
+        '-# ' + msg.getFrom() + '（' + Utilities.formatDate(msg.getDate(), 'Asia/Taipei', 'MM/dd HH:mm') + '）｜[開啟信件](<https://mail.google.com/mail/' + (MAIL_ACCOUNT ? '?authuser=' + encodeURIComponent(MAIL_ACCOUNT) : 'u/0/') + '#search/rfc822msgid:' + encodeURIComponent(msg.getHeader('Message-ID').replace(/[<>]/g, '')) + '>)'
       );
       var content = lines.join('\n');
       UrlFetchApp.fetch(WEBHOOK_URL, {
