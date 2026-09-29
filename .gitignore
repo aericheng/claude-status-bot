@@ -1,3 +1,5 @@
 config.json
 state.json
 watcher.log
+watcher.lock
+backup-2026-09-29-fix/

@@ -7,6 +7,8 @@
 //   node watcher.js          常駐，每 pollMinutes 分鐘更新一次
 //   node watcher.js --once   跑一輪就結束（測試/排程用）
 //   node watcher.js --dry    只印出會發送的內容，不打 Discord（測試用）
+// Exit code：0 正常結束（--once/--dry）；1 未預期錯誤（start-watcher.cmd loop 會重啟）；
+//   2 設定錯誤（loop 停止）；3 另一實例已在執行（loop 等 5 分鐘後重試）。
 
 const fs = require('fs');
 const path = require('path');
@@ -596,6 +598,38 @@ async function tick(config) {
   );
 }
 
+const LOCK_PATH = path.join(__dirname, 'watcher.lock');
+// 回傳 true = 拿到鎖；false = 另一個實例還活著（lock 內的 PID 存在）
+// 兩實例同時競爭時，openSync 'wx' 的 EEXIST 會 throw，由呼叫端視為拿不到鎖
+function acquireLock(lockPath = LOCK_PATH) {
+  if (fs.existsSync(lockPath)) {
+    const pid = Number(fs.readFileSync(lockPath, 'utf8').trim());
+    if (Number.isInteger(pid) && pid > 0 && pid !== process.pid) {
+      try { process.kill(pid, 0); return false; } // 還活著
+      catch { /* 殘鎖 */ }
+    }
+    try { fs.unlinkSync(lockPath); } catch {}
+    log(`stale lock removed (pid ${pid})`);
+  }
+  const fd = fs.openSync(lockPath, 'wx');
+  fs.writeSync(fd, String(process.pid));
+  fs.closeSync(fd);
+  const release = () => { try { if (fs.readFileSync(lockPath, 'utf8').trim() === String(process.pid)) fs.unlinkSync(lockPath); } catch {} };
+  process.on('exit', release);
+  process.on('SIGINT', () => process.exit(130));
+  process.on('SIGTERM', () => process.exit(143));
+  return true;
+}
+
+process.on('unhandledRejection', (reason) => {
+  log('unhandledRejection: ' + (reason && reason.stack ? reason.stack : String(reason))); // 不 exit，讓單一 promise 失敗不拖垮 watcher
+});
+process.on('uncaughtException', (err) => {
+  log('uncaughtException: ' + (err && err.stack ? err.stack : String(err)));
+  process.exitCode = 1;
+  setTimeout(() => process.exit(1), 2000).unref(); // 給 log flush 的時間，然後交給 loop 重啟
+});
+
 async function main() {
   const config = loadJson(CONFIG_PATH, null);
   if (!config || !config.webhookUrl || config.webhookUrl.includes('PENDING')) {
@@ -609,13 +643,28 @@ async function main() {
       console.log('alerts:', JSON.stringify(alerts, null, 1));
       return;
     }
-    console.error('config.json 的 webhookUrl 尚未設定，結束。');
-    process.exit(1);
+    console.error('config.json 的 webhookUrl 尚未設定，結束（exit 2，loop 不會重啟）。');
+    process.exit(2);
+  }
+
+  if (!ONCE) {
+    let got = false;
+    try { got = acquireLock(); } catch (e) { got = false; } // EEXIST 競爭也視為拿不到
+    if (!got) {
+      log('another instance is running (see watcher.lock), exit 3');
+      process.exit(3);
+    }
   }
 
   const pollMs = (config.pollMinutes || 5) * 60 * 1000;
-  const run = () =>
-    tick(config).catch((e) => log('tick error: ' + e.message));
+  let inFlight = false;
+  const run = async () => {
+    if (inFlight) { log('tick skipped: previous tick still running'); return; }
+    inFlight = true;
+    try { await tick(config); }
+    catch (e) { log('tick error: ' + e.message); }
+    finally { inFlight = false; }
+  };
   await run();
   if (!ONCE) setInterval(run, pollMs);
 }
@@ -634,4 +683,6 @@ module.exports = {
   fetchUsage,
   readUsageCache,
   tick,
+  acquireLock,
+  LOCK_PATH,
 };
