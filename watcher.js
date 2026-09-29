@@ -49,6 +49,16 @@ const OUTAGE_SOURCES = [
   },
 ];
 
+// 死人開關：這些日報成功時會寫 last-success（ISO 時間字串）；超過 26 小時沒更新就發告警（同一項 12 小時內只發一次）。
+// 檔案不存在只記 log、不告警（避免上線當下誤報）。
+const DEADMAN_FILES = [
+  { key: 'e3', name: 'E3 日報', file: 'C:/Users/user/Desktop/dev/e3-course-watch/data/last-success' },
+  { key: 'gmail', name: 'Gmail 日報', file: 'C:/Users/user/Desktop/dev/gmail-watch/data/last-success' },
+  { key: 'lofi', name: 'Lofi 日報', file: 'C:/Users/user/Desktop/dev/youtube generator/data/last-success' },
+];
+const DEADMAN_MAX_AGE_MS = 26 * 60 * 60 * 1000;
+const DEADMAN_REALERT_MS = 12 * 60 * 60 * 1000;
+
 const args = process.argv.slice(2);
 const ONCE = args.includes('--once') || args.includes('--dry');
 const DRY = args.includes('--dry');
@@ -67,6 +77,33 @@ function loadJson(p, fallback) {
 
 function saveState(state) {
   fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 1));
+}
+
+// 死人開關：notify(content) 為注入的發送函式（測試用假函式）；回傳本輪觸發的 key 陣列。
+// 內容時間＝檔案內容的 ISO 時間字串，解析失敗退回 mtime。state.deadman[key]＝上次告警時間（ms）。
+async function checkDeadman(state, notify, opts = {}) {
+  const files = opts.files || DEADMAN_FILES;
+  const now = opts.now || Date.now();
+  const d = (state.deadman = state.deadman || {});
+  const fired = [];
+  for (const item of files) {
+    let at;
+    try {
+      const st = fs.statSync(item.file);
+      const t = Date.parse(fs.readFileSync(item.file, 'utf8').trim());
+      at = Number.isFinite(t) ? t : st.mtimeMs;
+    } catch (e) {
+      log(`deadman: ${item.name} last-success 不存在或讀不到（${e.code || e.message}），略過`);
+      continue;
+    }
+    const age = now - at;
+    if (age <= DEADMAN_MAX_AGE_MS) continue;
+    if (d[item.key] && now - d[item.key] < DEADMAN_REALERT_MS) continue;
+    await notify(`⚠️ ${item.name} 日報超過 26 小時沒成功（上次成功 ${tw(new Date(at).toISOString())}，已過 ${(age / 3600000).toFixed(1)} 小時）`);
+    d[item.key] = now;
+    fired.push(item.key);
+  }
+  return fired;
 }
 
 // 台灣時間顯示（MM/DD HH:mm）
@@ -111,8 +148,8 @@ function rocDate(s) {
 // ===== 資料抓取 =====
 async function fetchStatus() {
   const [summary, incidents] = await Promise.all([
-    fetch(STATUS_SUMMARY_URL).then((r) => r.json()),
-    fetch(STATUS_INCIDENTS_URL).then((r) => r.json()),
+    fetch(STATUS_SUMMARY_URL, { signal: AbortSignal.timeout(15000) }).then((r) => r.json()),
+    fetch(STATUS_INCIDENTS_URL, { signal: AbortSignal.timeout(15000) }).then((r) => r.json()),
   ]);
   return { summary, incidents: incidents.incidents || [] };
 }
@@ -159,6 +196,7 @@ async function fetchUsage() {
 
   const res = await fetch(USAGE_URL, {
     headers: { Authorization: `Bearer ${oauth.accessToken}`, 'anthropic-beta': 'oauth-2025-04-20' },
+    signal: AbortSignal.timeout(15000),
   });
   if (res.status === 429) {
     usageBackoffUntil = Date.now() + USAGE_BACKOFF_MS;
@@ -190,6 +228,7 @@ async function webhookPost(config, payload) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ username: 'Claude Status', avatar_url: AVATAR_URL, ...payload }),
+    signal: AbortSignal.timeout(15000),
   });
   if (!res.ok) throw new Error(`webhook POST HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
   return res.json();
@@ -200,7 +239,7 @@ async function webhookDelete(config, messageId) {
     log('DRY delete ' + messageId);
     return;
   }
-  const res = await fetch(`${config.webhookUrl}/messages/${messageId}`, { method: 'DELETE' });
+  const res = await fetch(`${config.webhookUrl}/messages/${messageId}`, { method: 'DELETE', signal: AbortSignal.timeout(15000) });
   if (!res.ok && res.status !== 404) throw new Error(`webhook DELETE HTTP ${res.status}`);
 }
 
@@ -213,6 +252,7 @@ async function webhookEdit(config, messageId, payload) {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(15000),
   });
   if (res.status === 404) return false; // 訊息被刪了 → 呼叫端重發
   if (!res.ok) throw new Error(`webhook PATCH HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
@@ -537,6 +577,13 @@ async function tick(config) {
   } catch (e) {
     log('outage check error: ' + e.message);
   }
+  // 死人開關獨立 try/catch＋提前存檔（同停電線）
+  try {
+    const fired = await checkDeadman(state, (content) => webhookPost(config, { content }));
+    if (fired.length && !DRY) saveState(state);
+  } catch (e) {
+    log('deadman check error: ' + e.message);
+  }
   const [status, u] = await Promise.all([
     fetchStatus(),
     fetchUsage().catch((e) => ({ data: null, note: e.message, stale: readUsageCache() })),
@@ -682,6 +729,7 @@ module.exports = {
   collectAlerts,
   fetchUsage,
   readUsageCache,
+  checkDeadman,
   tick,
   acquireLock,
   LOCK_PATH,
