@@ -18,6 +18,10 @@ const path = require('path');
       signal: AbortSignal.timeout(10000),
     });
     if (!res.ok) console.error('notify-fail: HTTP ' + res.status);
+    else {
+      // 通知 watcher：儀表板被擠上去了，請重貼到最底。寫檔失敗不影響呼叫端
+      try { require('fs').writeFileSync(path.join(__dirname, '..', 'dashboard.bump'), new Date().toISOString()); } catch {}
+    }
   } catch (e) {
     console.error('notify-fail: ' + e.message);
   }

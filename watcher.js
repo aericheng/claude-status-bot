@@ -17,6 +17,9 @@ const { execSync } = require('child_process');
 const DIR = __dirname;
 const CONFIG_PATH = path.join(DIR, 'config.json');
 const STATE_PATH = path.join(DIR, 'state.json');
+// 其他本機發送端（ops-audit、notify-fail、lofi）送出訊息後會寫這個檔；mtime 晚於儀表板最後貼出時間＝儀表板被擠上去了
+const BUMP_PATH = path.join(DIR, 'dashboard.bump');
+const BUMP_CHECK_MS = 15 * 1000;
 const CREDENTIALS_PATH = 'C:/Users/user/.claude/.credentials.json';
 
 const STATUS_SUMMARY_URL = 'https://status.claude.com/api/v2/summary.json';
@@ -50,7 +53,7 @@ const OUTAGE_SOURCES = [
 ];
 
 // 死人開關：這些日報成功時會寫 last-success（ISO 時間字串）；超過 26 小時沒更新就發告警（同一項 12 小時內只發一次）。
-// 檔案不存在只記 log、不告警（避免上線當下誤報）。
+// 檔案不存在：從 watcher 首次看到起算（state.deadmanMissing[key]），超過 26 小時同樣告警「從未成功過」；檔案出現即清除。
 const DEADMAN_FILES = [
   { key: 'e3', name: 'E3 日報', file: 'C:/Users/user/Desktop/dev/e3-course-watch/data/last-success' },
   { key: 'gmail', name: 'Gmail 日報', file: 'C:/Users/user/Desktop/dev/gmail-watch/data/last-success' },
@@ -93,9 +96,27 @@ async function checkDeadman(state, notify, opts = {}) {
       const t = Date.parse(fs.readFileSync(item.file, 'utf8').trim());
       at = Number.isFinite(t) ? t : st.mtimeMs;
     } catch (e) {
-      log(`deadman: ${item.name} last-success 不存在或讀不到（${e.code || e.message}），略過`);
+      if (e.code !== 'ENOENT') {
+        log(`deadman: ${item.name} last-success 讀不到（${e.code || e.message}），略過`);
+        continue;
+      }
+      // 檔案不存在：從 watcher 第一次看到不存在起算，持續超過門檻就告警（沿用 12h 去重）
+      const m = (state.deadmanMissing = state.deadmanMissing || {});
+      if (!m[item.key]) {
+        m[item.key] = now;
+        log(`deadman: ${item.name} last-success 不存在，從現在起算 ${DEADMAN_MAX_AGE_MS / 3600000}h`);
+        continue;
+      }
+      const missAge = now - m[item.key];
+      if (missAge <= DEADMAN_MAX_AGE_MS) continue;
+      if (d[item.key] && now - d[item.key] < DEADMAN_REALERT_MS) continue;
+      log(`deadman: ${item.name} last-success 持續不存在超過 ${DEADMAN_MAX_AGE_MS / 3600000}h，告警`);
+      await notify(`⚠️ ${item.name} 日報從未成功過（last-success 不存在，已觀察 ${(missAge / 3600000).toFixed(1)} 小時，超過 26 小時）`);
+      d[item.key] = now;
+      fired.push(item.key);
       continue;
     }
+    if (state.deadmanMissing) delete state.deadmanMissing[item.key];
     const age = now - at;
     if (age <= DEADMAN_MAX_AGE_MS) continue;
     if (d[item.key] && now - d[item.key] < DEADMAN_REALERT_MS) continue;
@@ -256,6 +277,48 @@ async function webhookEdit(config, messageId, payload) {
   });
   if (res.status === 404) return false; // 訊息被刪了 → 呼叫端重發
   if (!res.ok) throw new Error(`webhook PATCH HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  return true;
+}
+
+// bump 判斷：標記檔 mtime 晚於儀表板最後貼出時間（postedAt，ms）→ true。檔案不存在／讀不到＝false；postedAt 缺＝視為 0
+function bumpNeeded(bumpPath, postedAt) {
+  try {
+    return fs.statSync(bumpPath).mtimeMs > (Number(postedAt) || 0);
+  } catch {
+    return false;
+  }
+}
+
+// 貼一則新儀表板到最底，成功後才刪舊的並更新 state（POST 失敗會 throw，state 原封不動、舊 id 保留）
+async function repostDashboard(config, state, dashboard) {
+  const oldId = state.dashboardMessageId;
+  // 在 POST 之前記時間：POST 進行中別人寫的 bump 會晚於它，下一輪 15 秒檢查會再重貼一次（最多多貼一次，不會迴圈）
+  const postStartedAt = Date.now();
+  const msg = await webhookPost(config, dashboard);
+  const newId = msg && msg.id && msg.id !== 'dry-run' ? msg.id : null;
+  if (newId) state.dashboardMessageId = newId;
+  state.dashboardPostedAt = postStartedAt;
+  if (oldId && (newId || DRY)) {
+    try {
+      await webhookDelete(config, oldId);
+      log(`dashboard deleted: ${oldId}`);
+    } catch (e) {
+      log(`dashboard cleanup failed: ${e.message}`);
+    }
+  }
+  return msg;
+}
+
+let lastDashboard = null; // 最近一次 tick 組好的儀表板 payload，給 15 秒 bump 檢查重發用
+
+// 輕量檢查：不打用量 API，只比 mtime；需要 bump 就用上次內容重貼。呼叫端須持有 inFlight
+async function bumpCheck(config) {
+  if (!lastDashboard) return false;
+  const state = loadJson(STATE_PATH, {});
+  if (!state.dashboardMessageId || !bumpNeeded(BUMP_PATH, state.dashboardPostedAt)) return false;
+  const msg = await repostDashboard(config, state, lastDashboard);
+  if (!DRY) saveState(state);
+  log(`dashboard bumped to bottom: ${msg && msg.id}`);
   return true;
 }
 
@@ -580,7 +643,8 @@ async function tick(config) {
   // 死人開關獨立 try/catch＋提前存檔（同停電線）
   try {
     const fired = await checkDeadman(state, (content) => webhookPost(config, { content }));
-    if (fired.length && !DRY) saveState(state);
+    // 每次都存：deadmanMissing 的起算時間不能因後面 fetchStatus 失敗中斷 tick 而遺失
+    if (!DRY) saveState(state);
   } catch (e) {
     log('deadman check error: ' + e.message);
   }
@@ -625,15 +689,14 @@ async function tick(config) {
   // 儀表板：本輪沒發任何通報就原地編輯；有發通報（儀表板被擠上去了）就刪掉舊的、重發一則到頻道最底，
   // 讓用量永遠停在畫面最下方（因此儀表板訊息 id 會變，不要釘選）
   const dashboard = buildDashboard(status, usage, u);
-  const bumped = postsThisTick > 0;
+  lastDashboard = dashboard;
+  const bumped = postsThisTick > 0 || bumpNeeded(BUMP_PATH, state.dashboardPostedAt);
   let edited = false;
   if (state.dashboardMessageId && !bumped) {
     edited = await webhookEdit(config, state.dashboardMessageId, dashboard);
   }
   if (!edited) {
-    if (state.dashboardMessageId && bumped) await tryDelete(state.dashboardMessageId, 'dashboard');
-    const msg = await webhookPost(config, dashboard);
-    if (msg && msg.id && msg.id !== 'dry-run') state.dashboardMessageId = msg.id;
+    const msg = await repostDashboard(config, state, dashboard);
     log(`dashboard message ${bumped ? 're-posted to bottom' : 'created'}: ${msg.id}`);
   }
 
@@ -704,7 +767,7 @@ async function main() {
   }
 
   const pollMs = (config.pollMinutes || 5) * 60 * 1000;
-  let inFlight = false;
+  let inFlight = false; // tick 與 bump 檢查共用，不可同時執行
   const run = async () => {
     if (inFlight) { log('tick skipped: previous tick still running'); return; }
     inFlight = true;
@@ -713,7 +776,16 @@ async function main() {
     finally { inFlight = false; }
   };
   await run();
-  if (!ONCE) setInterval(run, pollMs);
+  if (!ONCE) {
+    setInterval(run, pollMs);
+    setInterval(async () => {
+      if (inFlight) return; // tick 進行中就跳過，下一個 15 秒再看
+      inFlight = true;
+      try { await bumpCheck(config); }
+      catch (e) { log('bump check error: ' + e.message); }
+      finally { inFlight = false; }
+    }, BUMP_CHECK_MS);
+  }
 }
 
 if (!process.env.WATCHER_NO_MAIN) main();
@@ -726,6 +798,8 @@ module.exports = {
   fetchOutageDetail,
   listLocalServices,
   buildDashboard,
+  bumpNeeded,
+  repostDashboard,
   collectAlerts,
   fetchUsage,
   readUsageCache,
