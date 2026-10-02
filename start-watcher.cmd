@@ -9,6 +9,8 @@ set PATH=C:\Program Files\nodejs;%PATH%
 cd /d "C:\Users\user\Desktop\dev\claude status"
 set /a fails=0
 :loop
+rem Rotate watcher.log (>5 MB, keep 5) while no process holds it open; output must not go to the log itself.
+"C:\Program Files\nodejs\node.exe" scripts\rotate-logs.js watcher.log >nul 2>&1
 call :now t0
 "C:\Program Files\nodejs\node.exe" watcher.js >> watcher.log 2>&1
 set rc=%errorlevel%
