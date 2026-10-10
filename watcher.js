@@ -185,11 +185,35 @@ function summarizeApiLedger(now = new Date(), ledgerPath = API_LEDGER_PATH) {
   return { usedUsd, calls, end };
 }
 
-function apiCreditLine(now = new Date(), ledgerPath = API_LEDGER_PATH) {
+// 共用 API 冷卻檔（各專案 API 失敗改走訂閱時寫入；env AUTOMATION_API_COOLDOWN 可覆寫路徑）。
+// 回傳目前有效的冷卻 { until: Date, reason }，沒有／壞檔／已過期回 null。
+const API_COOLDOWN_PATH = process.env.AUTOMATION_API_COOLDOWN || path.join(DIR, 'api-cooldown.json');
+const COOLDOWN_REASON_TEXT = { credit: '額度用完', auth: '金鑰錯誤', rate: '速率限制' };
+function readApiCooldown(now = new Date(), cooldownPath = API_COOLDOWN_PATH) {
+  try {
+    const j = JSON.parse(fs.readFileSync(cooldownPath, 'utf8'));
+    const until = new Date(j && j.until);
+    if (Number.isFinite(until.getTime()) && until.getTime() > now.getTime()) return { until, reason: j.reason };
+  } catch {
+    // 沒有冷卻檔或壞檔 → 視為沒有冷卻
+  }
+  return null;
+}
+
+function apiCreditLine(now = new Date(), ledgerPath = API_LEDGER_PATH, cooldownPath = API_COOLDOWN_PATH) {
   const { usedUsd, calls, end } = summarizeApiLedger(now, ledgerPath);
   const pct = Math.round((usedUsd / API_CREDIT_TOTAL_USD) * 1000) / 10;
   const md = end.toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric' });
-  return `${colorBar(pct)} API 額度 **$${usedUsd.toFixed(2)} / $${API_CREDIT_TOTAL_USD}**（${calls} 次，本機估算，${md} 重置）`;
+  let line = `${colorBar(pct)} API 額度 **$${usedUsd.toFixed(2)} / $${API_CREDIT_TOTAL_USD}**（${calls} 次，本機估算，${md} 重置）`;
+  const cd = readApiCooldown(now, cooldownPath);
+  if (cd) {
+    const p = Object.fromEntries(
+      new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
+        .formatToParts(cd.until).map((x) => [x.type, x.value]),
+    );
+    line += `（⏸ API 暫停至 ${p.month}/${p.day} ${p.hour}:${p.minute}，原因：${COOLDOWN_REASON_TEXT[cd.reason] || '未知'}）`;
+  }
+  return line;
 }
 
 // 彩色進度條：每格 10%，顏色隨用量升級（<50 綠、50-79 黃、80-94 橙、≥95 紅）
@@ -854,6 +878,7 @@ module.exports = {
   apiCreditCycle,
   summarizeApiLedger,
   apiCreditLine,
+  readApiCooldown,
   bumpNeeded,
   repostDashboard,
   collectAlerts,

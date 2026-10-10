@@ -6,3 +6,5 @@ backup-2026-09-29-fix/
 dashboard.bump
 backup-*/
 api-ledger.jsonl
+api-cooldown.json
+api-cooldown.json.tmp-*
