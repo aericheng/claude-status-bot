@@ -62,6 +62,14 @@ const DEADMAN_FILES = [
 const DEADMAN_MAX_AGE_MS = 26 * 60 * 60 * 1000;
 const DEADMAN_REALERT_MS = 12 * 60 * 60 * 1000;
 
+// Max 方案每月附的 API credits（2026-10-10 起）：e3-course-watch／gmail-watch／plane bot 走 API 時，
+// 每次呼叫把 claude -p 回報的 total_cost_usd append 一行 JSON 到這個帳本；儀表板按額度週期加總顯示。
+// 只算這三支程式（Playground、其他用途不在內），所以標「本機估算」，準確值以 Console 的 Credits 為準。
+// 週期：額度每月在 API_CREDIT_CYCLE_DAY 號（UTC）發放、下個月同日到期（Console Billing：granted 10/10、expires 11/10）。
+const API_LEDGER_PATH = path.join(DIR, 'api-ledger.jsonl');
+const API_CREDIT_TOTAL_USD = 100;
+const API_CREDIT_CYCLE_DAY = 10;
+
 const args = process.argv.slice(2);
 const ONCE = args.includes('--once') || args.includes('--dry');
 const DRY = args.includes('--dry');
@@ -138,6 +146,50 @@ function tw(iso) {
     minute: '2-digit',
     hour12: false,
   });
+}
+
+// 目前額度週期 [start, end)（UTC），以每月 API_CREDIT_CYCLE_DAY 號 00:00 UTC 為界
+function apiCreditCycle(now = new Date()) {
+  const y = now.getUTCFullYear();
+  const m = now.getUTCMonth();
+  let start = new Date(Date.UTC(y, m, API_CREDIT_CYCLE_DAY));
+  if (start > now) start = new Date(Date.UTC(y, m - 1, API_CREDIT_CYCLE_DAY));
+  const end = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, API_CREDIT_CYCLE_DAY));
+  return { start, end };
+}
+
+// 讀帳本，回傳本週期 { usedUsd, calls, end } ；帳本不存在＝本週期 0 元（尚未有 API 呼叫），壞行略過
+function summarizeApiLedger(now = new Date(), ledgerPath = API_LEDGER_PATH) {
+  const { start, end } = apiCreditCycle(now);
+  let usedUsd = 0;
+  let calls = 0;
+  let text = '';
+  try {
+    text = fs.readFileSync(ledgerPath, 'utf8');
+  } catch {
+    return { usedUsd, calls, end };
+  }
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const e = JSON.parse(line);
+      const t = new Date(e.ts);
+      if (!(t >= start && t < end)) continue;
+      const c = Number(e.cost_usd);
+      if (Number.isFinite(c) && c > 0) usedUsd += c;
+      calls += 1;
+    } catch {
+      /* 壞行（例如寫到一半）略過 */
+    }
+  }
+  return { usedUsd, calls, end };
+}
+
+function apiCreditLine(now = new Date(), ledgerPath = API_LEDGER_PATH) {
+  const { usedUsd, calls, end } = summarizeApiLedger(now, ledgerPath);
+  const pct = Math.round((usedUsd / API_CREDIT_TOTAL_USD) * 1000) / 10;
+  const md = end.toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric' });
+  return `${colorBar(pct)} API 額度 **$${usedUsd.toFixed(2)} / $${API_CREDIT_TOTAL_USD}**（${calls} 次，本機估算，${md} 重置）`;
 }
 
 // 彩色進度條：每格 10%，顏色隨用量升級（<50 綠、50-79 黃、80-94 橙、≥95 紅）
@@ -350,6 +402,7 @@ function buildDashboard(status, usage, meta = {}) {
           ...(usage ? [] : [`⚠️ ${meta.note || '暫時無法更新'}，以上為 ${hhmm(meta.stale.at)} 的資料`]),
         ]
       : [`⚠️ 用量資料暫時無法取得（${meta.note || 'API 限流或逾時'}），恢復後自動補上`]),
+    apiCreditLine(),
     ...active.slice(0, 3).map((i) => `${IMPACT_EMOJI[i.impact] || '🚨'} ${i.name}（${i.status}）`),
   ];
   if (active.length > 3) lines.push(`…另有 ${active.length - 3} 件進行中`);
@@ -798,6 +851,9 @@ module.exports = {
   fetchOutageDetail,
   listLocalServices,
   buildDashboard,
+  apiCreditCycle,
+  summarizeApiLedger,
+  apiCreditLine,
   bumpNeeded,
   repostDashboard,
   collectAlerts,
