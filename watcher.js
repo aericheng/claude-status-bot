@@ -58,6 +58,19 @@ const DEADMAN_FILES = [
   { key: 'e3', name: 'E3 日報', file: 'C:/Users/user/Desktop/dev/e3-course-watch/data/last-success' },
   { key: 'gmail', name: 'Gmail 日報', file: 'C:/Users/user/Desktop/dev/gmail-watch/data/last-success' },
   { key: 'lofi', name: 'Lofi 日報', file: 'C:/Users/user/Desktop/dev/youtube generator/data/last-success' },
+  // 2026-10-29 起的「每日固定時刻」型（有 dailyAt）：最近一次「dailyAt＋graceMin 已過」的那一輪，檔案時間必須晚於 dailyAt 前 5 分鐘，
+  // 否則告警（每一輪只告警一次）。file 可含 {date}（該輪的本機日期 YYYY-MM-DD），也可傳陣列（依序全部讀）。
+  //   mtimeOnly：用檔案 mtime 當「有跑過」的證據；marker：改讀檔案內容，找符合的最新一行（行內第一個 ISO 時間戳）
+  //   since：YYYY-MM-DD，之前的輪次不檢查（新功能第一輪之前不該告警）
+  // lab-slack：run-daily.log 在每次 Daily 啟動（含額度失敗班、quota-gate 延後）都會被寫，所以 mtime 新＝「06:30 那班有跑」。
+  //   額度失敗是預期狀態（health-check 會報 warn），不是這裡的事；這裡只抓「排程根本沒跑」。
+  { key: 'labslack', name: 'lab-slack 日報', file: 'C:/Users/user/Desktop/dev/lab-slack-watch/logs/run-daily.log', dailyAt: '06:30', graceMin: 90, mtimeOnly: true },
+  // plane：data/digest-state.json 只在「有發出」時才寫，沒事件的日子（skipped）不更新，拿它當死人開關會天天誤報，
+  // 所以改看 bot.log 的 `digest daily (sent|skipped)`（兩種都算有跑）。bot.log 啟動時超過 5MB 會輪成 .1，兩檔都讀。
+  { key: 'plane', name: 'Plane 每日摘要', file: ['C:/Users/user/Desktop/dev/plane/plane-discord-bot/bot.log.1', 'C:/Users/user/Desktop/dev/plane/plane-discord-bot/bot.log'],
+    marker: /\[bot\] digest daily (sent|skipped) /, dailyAt: '07:30', graceMin: 60, since: '2026-10-30' },
+  // ops-audit：health-check 無法監控自己（OpsHealth-Daily 沒跑就沒人報），由這裡檢查當天報告檔（--dry 寫的是 .dry.md，不算）
+  { key: 'ophealth', name: 'OpsHealth 每日健康檢查', file: 'C:/Users/user/Desktop/dev/ops-audit/reports/health/health-{date}.md', dailyAt: '09:00', graceMin: 30, mtimeOnly: true },
 ];
 const DEADMAN_MAX_AGE_MS = 26 * 60 * 60 * 1000;
 const DEADMAN_REALERT_MS = 12 * 60 * 60 * 1000;
@@ -90,14 +103,79 @@ function saveState(state) {
   fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 1));
 }
 
+const DEADMAN_DAILY_SLACK_MS = 5 * 60 * 1000; // 排程可能早幾秒觸發
+
+// dailyAt 型項目：最近一次「dailyAt＋寬限已過」的輪次時刻（ms，本機時區）；since 之前或不是 dailyAt 型回 null
+function deadmanDue(item, now) {
+  if (!item.dailyAt) return null;
+  const [h, m] = item.dailyAt.split(':').map(Number);
+  const d = new Date(now);
+  d.setHours(h, m, 0, 0);
+  if (d.getTime() + (item.graceMin ?? 30) * 60000 > now) d.setDate(d.getDate() - 1);
+  if (item.since) {
+    const [y, mo, da] = item.since.split('-').map(Number);
+    if (d.getTime() < new Date(y, mo - 1, da).getTime()) return null;
+  }
+  return d.getTime();
+}
+
+// 解析項目的檔案路徑清單：{date} 換成 dueMs 當天的本機日期；file 可為字串或陣列
+function deadmanFiles(item, dueMs) {
+  const date = new Date(dueMs).toLocaleDateString('sv-SE');
+  return [].concat(item.file).map((f) => f.replaceAll('{date}', date));
+}
+
+// dailyAt 型項目「有跑過」的最新證據時間（ms）；沒有證據回 NaN。檔案讀不到（非 ENOENT）丟錯，由呼叫端略過
+function deadmanDailyEvidence(item, dueMs) {
+  let latest = NaN;
+  for (const f of deadmanFiles(item, dueMs)) {
+    let t = NaN;
+    try {
+      if (item.marker) {
+        for (const line of fs.readFileSync(f, 'utf8').split(/\r?\n/)) {
+          if (!item.marker.test(line)) continue;
+          const iso = /(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))/.exec(line);
+          const p = iso ? Date.parse(iso[1]) : NaN;
+          if (Number.isFinite(p) && !(p <= t)) t = p;
+        }
+      } else {
+        t = fs.statSync(f).mtimeMs;
+      }
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+    }
+    if (Number.isFinite(t) && !(t <= latest)) latest = t;
+  }
+  return latest;
+}
+
 // 死人開關：notify(content) 為注入的發送函式（測試用假函式）；回傳本輪觸發的 key 陣列。
 // 內容時間＝檔案內容的 ISO 時間字串，解析失敗退回 mtime。state.deadman[key]＝上次告警時間（ms）。
+// dailyAt 型項目（見 DEADMAN_FILES 註解）：每一輪（due）只告警一次——state.deadman[key] >= due 就不再發。
 async function checkDeadman(state, notify, opts = {}) {
   const files = opts.files || DEADMAN_FILES;
   const now = opts.now || Date.now();
   const d = (state.deadman = state.deadman || {});
   const fired = [];
   for (const item of files) {
+    if (item.dailyAt) {
+      const due = deadmanDue(item, now);
+      if (due == null) continue;
+      let at;
+      try {
+        at = deadmanDailyEvidence(item, due);
+      } catch (e) {
+        log(`deadman: ${item.name} 讀不到（${e.code || e.message}），略過`);
+        continue;
+      }
+      if (Number.isFinite(at) && at >= due - DEADMAN_DAILY_SLACK_MS) continue;
+      if (d[item.key] && d[item.key] >= due) continue;
+      const dueTxt = new Date(due).toLocaleString('zh-TW', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
+      await notify(`⚠️ ${item.name} 沒有在預期時間完成（應在 ${dueTxt} 前後；${Number.isFinite(at) ? `最後紀錄 ${tw(new Date(at).toISOString())}` : '找不到任何紀錄'}）`);
+      d[item.key] = now;
+      fired.push(item.key);
+      continue;
+    }
     let at;
     try {
       const st = fs.statSync(item.file);
@@ -158,16 +236,77 @@ function apiCreditCycle(now = new Date()) {
   return { start, end };
 }
 
+// 帳本每月輪替（2026-10-29 起）：首筆月份早於本月（台北時間）就把整檔改名為 api-ledger-YYYY-MM.jsonl（YYYY-MM＝首筆所在月，
+// 撞名加 -2、-3…），不刪不壓縮；寫入端（各專案 agents.js）每次 append 一行、不長期持有檔案，改名後下一次寫入自動新建。
+// 額度週期是每月 10 號（UTC）而不是日曆月，所以 summarizeApiLedger 會一併讀所有輪替檔（用 ts 過濾），週期跨月時不會少算。
+const LEDGER_TAIPEI_OFFSET_MS = 8 * 3600 * 1000;
+const ledgerMonth = (ms) => new Date(ms + LEDGER_TAIPEI_OFFSET_MS).toISOString().slice(0, 7);
+
+// 帳本首筆的月份（YYYY-MM，台北）；檔案不存在／空／沒有可解析的行回 null。只讀開頭 8KB
+function ledgerFirstMonth(ledgerPath = API_LEDGER_PATH) {
+  let fd;
+  try {
+    fd = fs.openSync(ledgerPath, 'r');
+    const buf = Buffer.alloc(8192);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    for (const line of buf.toString('utf8', 0, n).split('\n')) {
+      try {
+        const t = new Date(JSON.parse(line).ts).getTime();
+        if (Number.isFinite(t)) return ledgerMonth(t);
+      } catch {
+        /* 空行、壞行、被 8KB 截斷的最後一行 → 看下一行 */
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+// 回傳 { rotated, to?, reason? }；改名失敗（例如被占用）丟錯，由呼叫端記 log、下一輪再試
+function rotateApiLedger(now = new Date(), ledgerPath = API_LEDGER_PATH) {
+  const first = ledgerFirstMonth(ledgerPath);
+  if (!first) return { rotated: false, reason: 'empty-or-missing' };
+  if (first >= ledgerMonth(now.getTime())) return { rotated: false, reason: 'current-month' };
+  const base = ledgerPath.replace(/\.jsonl$/, '');
+  let to = `${base}-${first}.jsonl`;
+  for (let i = 2; fs.existsSync(to); i++) to = `${base}-${first}-${i}.jsonl`;
+  fs.renameSync(ledgerPath, to);
+  return { rotated: true, to };
+}
+
+// 現行帳本＋所有輪替檔（api-ledger-YYYY-MM[-N].jsonl）
+function ledgerFiles(ledgerPath = API_LEDGER_PATH) {
+  const dir = path.dirname(ledgerPath);
+  const base = path.basename(ledgerPath).replace(/\.jsonl$/, '');
+  const prefix = `${base}-`;
+  let rotated = [];
+  try {
+    rotated = fs
+      .readdirSync(dir)
+      .filter((n) => n.startsWith(prefix) && /^\d{4}-\d{2}(-\d+)?\.jsonl$/.test(n.slice(prefix.length)))
+      .sort()
+      .map((n) => path.join(dir, n));
+  } catch {
+    /* 目錄讀不到 → 只看現行檔 */
+  }
+  return [...rotated, ledgerPath];
+}
+
 // 讀帳本，回傳本週期 { usedUsd, calls, end } ；帳本不存在＝本週期 0 元（尚未有 API 呼叫），壞行略過
 function summarizeApiLedger(now = new Date(), ledgerPath = API_LEDGER_PATH) {
   const { start, end } = apiCreditCycle(now);
   let usedUsd = 0;
   let calls = 0;
   let text = '';
-  try {
-    text = fs.readFileSync(ledgerPath, 'utf8');
-  } catch {
-    return { usedUsd, calls, end };
+  for (const f of ledgerFiles(ledgerPath)) {
+    try {
+      text += fs.readFileSync(f, 'utf8') + '\n';
+    } catch {
+      /* 檔案不存在或讀不到 → 略過這個檔 */
+    }
   }
   for (const line of text.split('\n')) {
     if (!line.trim()) continue;
@@ -707,9 +846,22 @@ async function checkOutages(config, state) {
 }
 
 // ===== 主流程 =====
+let ledgerRotatedOn = null; // 本 process 已成功檢查過帳本輪替的本機日期（啟動後第一次 tick、之後每天第一次 tick 各做一次）
 async function tick(config) {
   const state = loadJson(STATE_PATH, {});
   postsThisTick = 0;
+
+  // 帳本每月輪替（--dry 不動檔案，避免測試留下副作用）
+  const todayLocal = new Date().toLocaleDateString('sv-SE');
+  if (!DRY && ledgerRotatedOn !== todayLocal) {
+    try {
+      const r = rotateApiLedger();
+      if (r.rotated) log(`api-ledger rotated -> ${path.basename(r.to)}`);
+      ledgerRotatedOn = todayLocal;
+    } catch (e) {
+      log('api-ledger rotate error: ' + e.message); // 不標記，下一輪 tick 再試
+    }
+  }
 
   // 停電線獨立 try/catch＋提前存檔：Claude API 掛掉不影響停電監控，反之亦然
   try {
@@ -877,6 +1029,13 @@ module.exports = {
   buildDashboard,
   apiCreditCycle,
   summarizeApiLedger,
+  ledgerMonth,
+  ledgerFirstMonth,
+  rotateApiLedger,
+  ledgerFiles,
+  deadmanDue,
+  deadmanFiles,
+  DEADMAN_FILES,
   apiCreditLine,
   readApiCooldown,
   bumpNeeded,

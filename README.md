@@ -63,6 +63,13 @@
 - `watcher.log` — 執行紀錄
 - `usage-api-sample.json` — 用量 API 回應樣本（欄位參考）
 
+## 死人開關與帳本輪替（2026-10-29）
+
+- `DEADMAN_FILES`（watcher.js）兩種寫法。舊式：`last-success` 超過 26 小時沒更新就告警（E3／Gmail／Lofi）。新式（有 `dailyAt`）：最近一次「`dailyAt`＋`graceMin` 已過」的那一輪，檔案時間必須晚於 `dailyAt` 前 5 分鐘，否則告警；每一輪只告警一次。`file` 可含 `{date}`（該輪的本機日期）或傳陣列；`mtimeOnly` 用檔案 mtime，`marker` 讀內容找符合的最新一行（行內第一個 ISO 時間戳）；`since` 之前的輪次不檢查。
+- 新式三項：lab-slack 日報（`logs/run-daily.log` mtime，06:30＋90 分）、Plane 每日摘要（`bot.log` 的 `digest daily (sent|skipped)`，07:30＋60 分；不用 `data/digest-state.json`，因為沒事件的日子只寫 skipped、不更新它）、OpsHealth（`ops-audit/reports/health/health-{date}.md`，09:00＋30 分）。額度失敗班不算 lab-slack 沒跑（log 仍會被寫），那屬 health-check 的 warn。
+- `api-ledger.jsonl` 每月輪替：watcher 啟動後第一次 tick、之後每天第一次 tick，若首筆時間（台北）早於本月，就把整檔改名成 `api-ledger-YYYY-MM.jsonl`（撞名加 `-2`），不刪不壓縮；寫入端每次 append 一行，改名後自動新建。額度週期是每月 10 號（UTC）而非日曆月，所以儀表板的 `summarizeApiLedger` 會一併讀所有輪替檔。
+- 測試：`node scripts/selftest-deadman.js`（死人開關含 dailyAt 型、帳本輪替與跨檔加總）。
+
 ## 測試指令
 
 - `node watcher.js --dry` — 不打 Discord，印出會發送的內容

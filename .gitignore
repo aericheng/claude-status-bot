@@ -8,3 +8,4 @@ backup-*/
 api-ledger.jsonl
 api-cooldown.json
 api-cooldown.json.tmp-*
+api-ledger-*.jsonl
